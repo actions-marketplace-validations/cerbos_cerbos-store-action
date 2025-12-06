@@ -9,10 +9,12 @@
     "docker:disable",
     ":gitSignOff",
     "group:allNonMajor",
+    "helpers:pinGitHubActionDigests",
     ":renovatePrefix",
     "schedule:monthly",
     ":semanticCommitTypeAll(chore)",
     ":separateMultipleMajorReleases"
   ],
-  "labels": ["area/dependencies", "bots", "kind/chore"]
+  "labels": ["area/dependencies", "bots", "kind/chore"],
+  "reviewers": ["oguzhand95"]
 }

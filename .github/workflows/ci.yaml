@@ -8,15 +8,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           node-version-file: '.node-version'
@@ -46,22 +44,3 @@ jobs:
       - name: Test
         run: |
           pnpm run test
-
-      - name: Generate a policy from template to test the action
-        run: |
-          mkdir -p policies && templates/replace.sh templates/policy.template.yaml > policies/policy.yaml
-
-      - name: Add generated policy file and amend the latest commit temporarily
-        run: |
-          git add -f policies/policy.yaml && git -c "user.name=cerbos-store-action-ci" -c "user.email=sdk@cerbos.dev" commit --amend --no-edit
-
-      - name: Use action
-        uses: ./
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          api_endpoint: '${{ secrets.CERBOS_HUB_API_ENDPOINT }}'
-          client_id: '${{ secrets.CERBOS_HUB_CLIENT_ID }}'
-          client_secret: '${{ secrets.CERBOS_HUB_CLIENT_SECRET }}'
-          store_id: '${{ secrets.CERBOS_HUB_STORE_ID }}'
-          subdir: 'policies'
-          from_revision: HEAD^

@@ -36180,21 +36180,30 @@ function onSecondaryRateLimit(retryAfter, options, octokit) {
 /** A special constant with type `never` */
 function $constructor(name, initializer, params) {
     function init(inst, def) {
-        var _a;
-        Object.defineProperty(inst, "_zod", {
-            value: inst._zod ?? {},
-            enumerable: false,
-        });
-        (_a = inst._zod).traits ?? (_a.traits = new Set());
+        if (!inst._zod) {
+            Object.defineProperty(inst, "_zod", {
+                value: {
+                    def,
+                    constr: _,
+                    traits: new Set(),
+                },
+                enumerable: false,
+            });
+        }
+        if (inst._zod.traits.has(name)) {
+            return;
+        }
         inst._zod.traits.add(name);
         initializer(inst, def);
         // support prototype modifications
-        for (const k in _.prototype) {
-            if (!(k in inst))
-                Object.defineProperty(inst, k, { value: _.prototype[k].bind(inst) });
+        const proto = _.prototype;
+        const keys = Object.keys(proto);
+        for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            if (!(k in inst)) {
+                inst[k] = proto[k].bind(inst);
+            }
         }
-        inst._zod.constr = _;
-        inst._zod.def = def;
     }
     // doesn't work if Parent has a constructor with arguments
     const Parent = params?.Parent ?? Object;
@@ -36314,6 +36323,14 @@ function mergeDefs(...defs) {
 function esc(str) {
     return JSON.stringify(str);
 }
+function slugify(input) {
+    return input
+        .toLowerCase()
+        .trim()
+        .replace(/[^\w\s-]/g, "")
+        .replace(/[\s_-]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+}
 const captureStackTrace = ("captureStackTrace" in Error ? Error.captureStackTrace : (..._args) => { });
 function isObject(data) {
     return typeof data === "object" && data !== null && !Array.isArray(data);
@@ -36338,6 +36355,8 @@ function isPlainObject(o) {
     // modified constructor
     const ctor = o.constructor;
     if (ctor === undefined)
+        return true;
+    if (typeof ctor !== "function")
         return true;
     // modified prototype
     const prot = ctor.prototype;
@@ -36795,9 +36814,6 @@ const cidrv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|::|([0-9a-fA-F]{1,4})?:
 // https://stackoverflow.com/questions/7860392/determine-if-string-is-in-base64-using-javascript
 const base64 = /^$|^(?:[0-9a-zA-Z+/]{4})*(?:(?:[0-9a-zA-Z+/]{2}==)|(?:[0-9a-zA-Z+/]{3}=))?$/;
 const base64url = /^[A-Za-z0-9_-]*$/;
-// based on https://stackoverflow.com/questions/106179/regular-expression-to-match-dns-hostname-or-ip-address
-// export const hostname: RegExp = /^([a-zA-Z0-9-]+\.)*[a-zA-Z0-9-]+$/;
-const hostname = /^(?=.{1,253}\.?$)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[-0-9a-zA-Z]{0,61}[0-9a-zA-Z])?)*\.?$/;
 const domain = /^([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
 // https://blog.stevenlevithan.com/archives/validate-phone-number#r4-3 (regex sans spaces)
 const e164 = /^\+(?:[0-9]){6,14}[0-9]$/;
@@ -37106,7 +37122,7 @@ class Doc {
 const version$1 = {
     major: 4,
     minor: 1,
-    patch: 12,
+    patch: 13,
 };
 
 const $ZodType = /*@__PURE__*/ $constructor("$ZodType", (inst, def) => {
@@ -37309,7 +37325,7 @@ const $ZodURL = /*@__PURE__*/ $constructor("$ZodURL", (inst, def) => {
                         code: "invalid_format",
                         format: "url",
                         note: "Invalid hostname",
-                        pattern: hostname.source,
+                        pattern: def.hostname.source,
                         input: payload.value,
                         inst,
                         continue: !def.abort,
@@ -37399,18 +37415,12 @@ const $ZodISODuration = /*@__PURE__*/ $constructor("$ZodISODuration", (inst, def
 const $ZodIPv4 = /*@__PURE__*/ $constructor("$ZodIPv4", (inst, def) => {
     def.pattern ?? (def.pattern = ipv4);
     $ZodStringFormat.init(inst, def);
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        bag.format = `ipv4`;
-    });
+    inst._zod.bag.format = `ipv4`;
 });
 const $ZodIPv6 = /*@__PURE__*/ $constructor("$ZodIPv6", (inst, def) => {
     def.pattern ?? (def.pattern = ipv6);
     $ZodStringFormat.init(inst, def);
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        bag.format = `ipv6`;
-    });
+    inst._zod.bag.format = `ipv6`;
     inst._zod.check = (payload) => {
         try {
             // @ts-ignore
@@ -37480,9 +37490,7 @@ function isValidBase64(data) {
 const $ZodBase64 = /*@__PURE__*/ $constructor("$ZodBase64", (inst, def) => {
     def.pattern ?? (def.pattern = base64);
     $ZodStringFormat.init(inst, def);
-    inst._zod.onattach.push((inst) => {
-        inst._zod.bag.contentEncoding = "base64";
-    });
+    inst._zod.bag.contentEncoding = "base64";
     inst._zod.check = (payload) => {
         if (isValidBase64(payload.value))
             return;
@@ -37506,9 +37514,7 @@ function isValidBase64URL(data) {
 const $ZodBase64URL = /*@__PURE__*/ $constructor("$ZodBase64URL", (inst, def) => {
     def.pattern ?? (def.pattern = base64url);
     $ZodStringFormat.init(inst, def);
-    inst._zod.onattach.push((inst) => {
-        inst._zod.bag.contentEncoding = "base64url";
-    });
+    inst._zod.bag.contentEncoding = "base64url";
     inst._zod.check = (payload) => {
         if (isValidBase64URL(payload.value))
             return;
@@ -37674,7 +37680,7 @@ function handleCatchall(proms, input, payload, ctx, def, inst) {
     const keySet = def.keySet;
     const _catchall = def.catchall._zod;
     const t = _catchall.def.type;
-    for (const key of Object.keys(input)) {
+    for (const key in input) {
         if (keySet.has(key))
             continue;
         if (t === "never") {
@@ -38019,13 +38025,14 @@ const $ZodLiteral = /*@__PURE__*/ $constructor("$ZodLiteral", (inst, def) => {
     if (def.values.length === 0) {
         throw new Error("Cannot create literal schema with no valid values");
     }
-    inst._zod.values = new Set(def.values);
+    const values = new Set(def.values);
+    inst._zod.values = values;
     inst._zod.pattern = new RegExp(`^(${def.values
         .map((o) => (typeof o === "string" ? escapeRegex(o) : o ? escapeRegex(o.toString()) : String(o)))
         .join("|")})$`);
     inst._zod.parse = (payload, _ctx) => {
         const input = payload.value;
-        if (inst._zod.values.has(input)) {
+        if (values.has(input)) {
             return payload;
         }
         payload.issues.push({
@@ -38251,8 +38258,8 @@ const $ZodReadonly = /*@__PURE__*/ $constructor("$ZodReadonly", (inst, def) => {
     $ZodType.init(inst, def);
     defineLazy(inst._zod, "propValues", () => def.innerType._zod.propValues);
     defineLazy(inst._zod, "values", () => def.innerType._zod.values);
-    defineLazy(inst._zod, "optin", () => def.innerType._zod.optin);
-    defineLazy(inst._zod, "optout", () => def.innerType._zod.optout);
+    defineLazy(inst._zod, "optin", () => def.innerType?._zod?.optin);
+    defineLazy(inst._zod, "optout", () => def.innerType?._zod?.optout);
     inst._zod.parse = (payload, ctx) => {
         if (ctx.direction === "backward") {
             return def.innerType._zod.run(payload, ctx);
@@ -38300,6 +38307,7 @@ function handleRefineResult(result, payload, input, inst) {
     }
 }
 
+var _a;
 class $ZodRegistry {
     constructor() {
         this._map = new WeakMap();
@@ -38349,7 +38357,8 @@ class $ZodRegistry {
 function registry() {
     return new $ZodRegistry();
 }
-const globalRegistry = /*@__PURE__*/ registry();
+(_a = globalThis).__zod_globalRegistry ?? (_a.__zod_globalRegistry = registry());
+const globalRegistry = globalThis.__zod_globalRegistry;
 
 function _string(Class, params) {
     return new Class({
@@ -38701,6 +38710,10 @@ function _toLowerCase() {
 function _toUpperCase() {
     return _overwrite((input) => input.toUpperCase());
 }
+// slugify
+function _slugify() {
+    return _overwrite((input) => slugify(input));
+}
 function _array(Class, element, params) {
     return new Class({
         type: "array",
@@ -38943,6 +38956,7 @@ const _ZodString = /*@__PURE__*/ $constructor("_ZodString", (inst, def) => {
     inst.normalize = (...args) => inst.check(_normalize(...args));
     inst.toLowerCase = () => inst.check(_toLowerCase());
     inst.toUpperCase = () => inst.check(_toUpperCase());
+    inst.slugify = () => inst.check(_slugify());
 });
 const ZodString = /*@__PURE__*/ $constructor("ZodString", (inst, def) => {
     $ZodString.init(inst, def);
@@ -39694,8 +39708,8 @@ const argsSchema = object({
     clientID: string().nonempty(),
     clientSecret: string().nonempty(),
     storeID: string().nonempty(),
-    fromRevision: string().nonempty(),
-    toRevision: string().nonempty(),
+    fromRevision: string().optional(),
+    toRevision: string().optional(),
     subDir: string().optional()
 });
 const validateArgs = (args) => {
@@ -39715,13 +39729,27 @@ const upload = async (args) => {
         coreExports.setFailed(`Environment variable ${workspaceEnvKey} is not set by the workflow runner.`);
         process.exit(1);
     }
-    let command = `${av.path} hub store upload-git ${args.fromRevision} ${args.toRevision} --path=${workspaceDir} --api-endpoint="${args.apiEndpoint}" --store-id=${args.storeID} --client-id=${args.clientID} --client-secret=${args.clientSecret}`;
+    let command = `${av.path} hub store upload-git --path=${workspaceDir} --api-endpoint="${args.apiEndpoint}" --store-id=${args.storeID} --client-id=${args.clientID} --client-secret=${args.clientSecret}`;
     if (args.subDir && args.subDir !== '') {
-        coreExports.info(`Subdirectory is set to ${args.subDir}`);
-        command += ` --subdir ${args.subDir}`;
+        coreExports.info(`--subdir is set to ${args.subDir}`);
+        command += ` --subdir=${args.subDir}`;
     }
     else {
-        coreExports.info('Subdirectory is not set');
+        coreExports.info('--subdir is not set');
+    }
+    if (args.fromRevision && args.fromRevision !== '') {
+        coreExports.info(`--from is set to ${args.fromRevision}`);
+        command += ` --from=${args.fromRevision}`;
+    }
+    else {
+        coreExports.info('--from is not set');
+    }
+    if (args.toRevision && args.toRevision !== '') {
+        coreExports.info(`--to is set to ${args.toRevision}`);
+        command += ` --to=${args.toRevision}`;
+    }
+    else {
+        coreExports.info('--to is not set');
     }
     coreExports.info(`The command to run is: ${command}`);
     coreExports.startGroup(`The results for the command ${command}`);
@@ -41407,12 +41435,6 @@ async function run() {
         coreExports.setFailed("The action input 'store_id', 'client_id' and 'client_secret' must be specified");
         process.exit(1);
     }
-    const fromRevision = coreExports.getInput('from_revision');
-    const toRevision = coreExports.getInput('to_revision');
-    if (fromRevision === '' || toRevision === '') {
-        coreExports.setFailed("The action input 'from_revision' and 'to_revision' must be specified");
-        process.exit(1);
-    }
     const octokit = new Octokit({
         auth: githubToken,
         request: {
@@ -41435,8 +41457,8 @@ async function run() {
         clientID: clientID,
         clientSecret: clientSecret,
         storeID: storeID,
-        fromRevision: fromRevision,
-        toRevision: toRevision,
+        fromRevision: coreExports.getInput('from_revision'),
+        toRevision: coreExports.getInput('to_revision'),
         subDir: coreExports.getInput('subdir')
     });
 }
