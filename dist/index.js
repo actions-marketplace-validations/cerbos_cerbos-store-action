@@ -2651,7 +2651,13 @@ function requireRequest$1 () {
 	      } else if (typeof val[i] === 'object') {
 	        throw new InvalidArgumentError(`invalid ${key} header`)
 	      } else {
-	        arr.push(`${val[i]}`);
+	        // Coerce primitives (and reject unsafe coercions such as functions
+	        // with a crafted toString/Symbol.toPrimitive).
+	        const str = `${val[i]}`;
+	        if (!isValidHeaderValue(str)) {
+	          throw new InvalidArgumentError(`invalid ${key} header`)
+	        }
+	        arr.push(str);
 	      }
 	    }
 	    val = arr;
@@ -2662,7 +2668,12 @@ function requireRequest$1 () {
 	  } else if (val === null) {
 	    val = '';
 	  } else {
+	    // Coerce primitives (and reject unsafe coercions such as functions
+	    // with a crafted toString/Symbol.toPrimitive).
 	    val = `${val}`;
+	    if (!isValidHeaderValue(val)) {
+	      throw new InvalidArgumentError(`invalid ${key} header`)
+	    }
 	  }
 
 	  if (headerName === 'host') {
@@ -8718,6 +8729,7 @@ function requireClientH1 () {
 	  RequestContentLengthMismatchError,
 	  ResponseContentLengthMismatchError,
 	  RequestAbortedError,
+	  InvalidArgumentError,
 	  HeadersTimeoutError,
 	  HeadersOverflowError,
 	  SocketError,
@@ -9701,8 +9713,16 @@ function requireClientH1 () {
 	    }
 	    body = bodyStream.stream;
 	    contentLength = bodyStream.length;
-	  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-	    headers.push('content-type', body.type);
+	  } else if (util.isBlobLike(body) && request.contentType == null) {
+	    const contentType = body.type;
+	    if (contentType) {
+	      const contentTypeValue = `${contentType}`;
+	      if (!util.isValidHeaderValue(contentTypeValue)) {
+	        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'));
+	        return false
+	      }
+	      headers.push('content-type', contentTypeValue);
+	    }
 	  }
 
 	  if (body && typeof body.read === 'function') {
@@ -13137,6 +13157,28 @@ function requireRetryHandler () {
 	  return new Date(retryAfter).getTime() - current
 	}
 
+	function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+	  const contentLength = headers['content-length'];
+	  if (contentLength == null) {
+	    return null
+	  }
+
+	  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+	    return null
+	  }
+
+	  const length = Number(contentLength);
+	  const expectedLength = range.end - range.start + 1;
+	  if (!Number.isFinite(length) || length !== expectedLength) {
+	    return new RequestRetryError('Content-Length mismatch', statusCode, {
+	      headers,
+	      data: { count: retryCount }
+	    })
+	  }
+
+	  return null
+	}
+
 	class RetryHandler {
 	  constructor (opts, handlers) {
 	    const { retryOptions, ...dispatchOpts } = opts;
@@ -13351,6 +13393,12 @@ function requireRetryHandler () {
 	        return false
 	      }
 
+	      const contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount);
+	      if (contentLengthError != null) {
+	        this.abort(contentLengthError);
+	        return false
+	      }
+
 	      const { start, size, end = size - 1 } = contentRange;
 
 	      assert(this.start === start, 'content-range mismatch');
@@ -13372,6 +13420,12 @@ function requireRetryHandler () {
 	            resume,
 	            statusMessage
 	          )
+	        }
+
+	        const contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount);
+	        if (contentLengthError != null) {
+	          this.abort(contentLengthError);
+	          return false
 	        }
 
 	        const { start, size, end = size - 1 } = range;
@@ -23762,7 +23816,7 @@ function requireUtil$2 () {
 
 	    if (
 	      code < 0x20 || // exclude CTLs (0-31)
-	      code === 0x7F || // DEL
+	      code > 0x7E || // exclude DEL and non-ascii
 	      code === 0x3B // ;
 	    ) {
 	      throw new Error('Invalid cookie path')
@@ -23771,16 +23825,80 @@ function requireUtil$2 () {
 	}
 
 	/**
-	 * I have no idea why these values aren't allowed to be honest,
-	 * but Deno tests these. - Khafra
+	 * <let-dig> ::= <letter> | <digit>
+	 *
+	 * <letter> ::= any one of the 52 alphabetic characters A through Z in
+	 * upper case and a through z in lower case
+	 *
+	 * <digit> ::= any one of the ten digits 0 through 9r
+	 *
+	 * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+	 * @param {number} code
+	 */
+	function isLetterOrDigit (code) {
+	  return (
+	    (code >= 0x30 && code <= 0x39) || // 0-9
+	    (code >= 0x41 && code <= 0x5A) || // A-Z
+	    (code >= 0x61 && code <= 0x7A) // a-z
+	  )
+	}
+
+	/**
+	 * Validates a cookie domain against the "preferred name syntax".
+	 *
+	 * <domain>      ::= <subdomain> | " "
+	 * <subdomain>   ::= <label> | <subdomain> "." <label>
+	 * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+	 * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+	 * <let-dig-hyp> ::= <let-dig> | "-"
+	 *
+	 * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+	 * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+	 * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
 	 * @param {string} domain
 	 */
 	function validateCookieDomain (domain) {
-	  if (
-	    domain.startsWith('-') ||
-	    domain.endsWith('.') ||
-	    domain.endsWith('-')
-	  ) {
+	  // <domain> ::= <subdomain> | " "
+	  if (domain === ' ') {
+	    return
+	  }
+
+	  if (domain.length > 255) {
+	    throw new Error('Invalid cookie domain')
+	  }
+
+	  let labelLength = 0;
+
+	  for (let i = 0; i < domain.length; ++i) {
+	    const code = domain.charCodeAt(i);
+
+	    if (code === 0x2E) {
+	      if (labelLength === 0) {
+	        throw new Error('Invalid cookie domain')
+	      }
+
+	      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+	        throw new Error('Invalid cookie domain')
+	      }
+
+	      labelLength = 0;
+	      continue
+	    }
+
+	    if (labelLength === 0 && !isLetterOrDigit(code)) {
+	      throw new Error('Invalid cookie domain')
+	    }
+
+	    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+	      throw new Error('Invalid cookie domain')
+	    }
+
+	    if (++labelLength > 63) {
+	      throw new Error('Invalid cookie domain')
+	    }
+	  }
+
+	  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
 	    throw new Error('Invalid cookie domain')
 	  }
 	}
@@ -23923,7 +24041,13 @@ function requireUtil$2 () {
 
 	    const [key, ...value] = part.split('=');
 
-	    out.push(`${key.trim()}=${value.join('=')}`);
+	    const trimmedKey = key.trim();
+	    const joinedValue = value.join('=');
+
+	    validateCookieName(trimmedKey);
+	    validateCookieValue(joinedValue);
+
+	    out.push(`${trimmedKey}=${joinedValue}`);
 	  }
 
 	  return out.join('; ')
@@ -23940,11 +24064,11 @@ function requireUtil$2 () {
 	return util$2;
 }
 
-var parse$2;
+var parse$3;
 var hasRequiredParse$1;
 
 function requireParse$1 () {
-	if (hasRequiredParse$1) return parse$2;
+	if (hasRequiredParse$1) return parse$3;
 	hasRequiredParse$1 = 1;
 
 	const { maxNameValuePairSize, maxAttributeValueSize } = requireConstants$2();
@@ -24251,11 +24375,11 @@ function requireParse$1 () {
 	  return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
 	}
 
-	parse$2 = {
+	parse$3 = {
 	  parseSetCookie,
 	  parseUnparsedAttributes
 	};
-	return parse$2;
+	return parse$3;
 }
 
 var cookies;
@@ -33632,7 +33756,7 @@ function expand(template, context) {
 }
 
 // pkg/dist-src/parse.js
-function parse$1(options) {
+function parse$2(options) {
   let method = options.method.toUpperCase();
   let url = (options.url || "/").replace(/:([a-z]\w+)/g, "{$1}");
   let headers = Object.assign({}, options.headers);
@@ -33698,7 +33822,7 @@ function parse$1(options) {
 
 // pkg/dist-src/endpoint-with-defaults.js
 function endpointWithDefaults(defaults, route, options) {
-  return parse$1(merge$1(defaults, route, options));
+  return parse$2(merge$1(defaults, route, options));
 }
 
 // pkg/dist-src/with-defaults.js
@@ -33709,193 +33833,137 @@ function withDefaults$2(oldDefaults, newDefaults) {
     DEFAULTS: DEFAULTS2,
     defaults: withDefaults$2.bind(null, DEFAULTS2),
     merge: merge$1.bind(null, DEFAULTS2),
-    parse: parse$1
+    parse: parse$2
   });
 }
 
 // pkg/dist-src/index.js
 var endpoint = withDefaults$2(null, DEFAULTS);
 
-var dist = {};
-
-var hasRequiredDist;
-
-function requireDist () {
-	if (hasRequiredDist) return dist;
-	hasRequiredDist = 1;
-	/*!
-	 * content-type
-	 * Copyright(c) 2015 Douglas Christopher Wilson
-	 * MIT Licensed
-	 */
-	Object.defineProperty(dist, "__esModule", { value: true });
-	dist.format = format;
-	dist.parse = parse;
-	const TEXT_REGEXP = /^[\u0009\u0020-\u007e\u0080-\u00ff]*$/;
-	const TOKEN_REGEXP = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
-	/**
-	 * RegExp to match chars that must be quoted-pair in RFC 9110 sec 5.6.4
-	 */
-	const QUOTE_REGEXP = /[\\"]/g;
-	/**
-	 * RegExp to match type in RFC 9110 sec 8.3.1
-	 *
-	 * media-type = type "/" subtype
-	 * type       = token
-	 * subtype    = token
-	 */
-	const TYPE_REGEXP = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
-	/**
-	 * Null object perf optimization. Faster than `Object.create(null)` and `{ __proto__: null }`.
-	 */
-	const NullObject = /* @__PURE__ */ (() => {
-	    const C = function () { };
-	    C.prototype = Object.create(null);
-	    return C;
-	})();
-	/**
-	 * Format an object into a `Content-Type` header.
-	 */
-	function format(obj) {
-	    const { type, parameters } = obj;
-	    if (!type || !TYPE_REGEXP.test(type)) {
-	        throw new TypeError(`Invalid type: ${type}`);
-	    }
-	    let result = type;
-	    if (parameters) {
-	        for (const param of Object.keys(parameters)) {
-	            if (!TOKEN_REGEXP.test(param)) {
-	                throw new TypeError(`Invalid parameter name: ${param}`);
-	            }
-	            result += `; ${param}=${qstring(parameters[param])}`;
-	        }
-	    }
-	    return result;
-	}
-	/**
-	 * Parse a `Content-Type` header.
-	 */
-	function parse(header, options) {
-	    const len = header.length;
-	    let index = skipOWS(header, 0, len);
-	    const valueStart = index;
-	    index = skipValue(header, index, len);
-	    const valueEnd = trailingOWS(header, valueStart, index);
-	    const type = header.slice(valueStart, valueEnd).toLowerCase();
-	    const parameters = options?.parameters === false
-	        ? new NullObject()
-	        : parseParameters(header, index, len);
-	    return { type, parameters };
-	}
-	const SP = 32; // " "
-	const HTAB = 9; // "\t"
-	const SEMI = 59; // ";"
-	const EQ = 61; // "="
-	const DQUOTE = 34; // '"'
-	const BSLASH = 92; // "\\"
-	/**
-	 * Parses the parameters of a `Content-Type` header starting at the given index.
-	 */
-	function parseParameters(header, index, len) {
-	    const parameters = new NullObject();
-	    parameter: while (index < len) {
-	        index = skipOWS(header, index + 1 /* Skip over ; */, len);
-	        const keyStart = index;
-	        while (index < len) {
-	            const code = header.charCodeAt(index);
-	            if (code === SEMI)
-	                continue parameter;
-	            if (code === EQ) {
-	                const keyEnd = trailingOWS(header, keyStart, index);
-	                const key = header.slice(keyStart, keyEnd).toLowerCase();
-	                index = skipOWS(header, index + 1, len);
-	                if (index < len && header.charCodeAt(index) === DQUOTE) {
-	                    index++;
-	                    let value = "";
-	                    while (index < len) {
-	                        const code = header.charCodeAt(index++);
-	                        if (code === DQUOTE) {
-	                            index = skipValue(header, index, len);
-	                            if (parameters[key] === undefined)
-	                                parameters[key] = value;
-	                            break;
-	                        }
-	                        if (code === BSLASH && index < len) {
-	                            value += header[index++];
-	                            continue;
-	                        }
-	                        value += String.fromCharCode(code);
-	                    }
-	                    continue parameter;
-	                }
-	                const valueStart = index;
-	                index = skipValue(header, index, len);
-	                if (parameters[key] === undefined) {
-	                    const valueEnd = trailingOWS(header, valueStart, index);
-	                    parameters[key] = header.slice(valueStart, valueEnd);
-	                }
-	                continue parameter;
-	            }
-	            index++;
-	        }
-	    }
-	    return parameters;
-	}
-	/**
-	 * Skip over characters until a semicolon.
-	 */
-	function skipValue(str, index, len) {
-	    while (index < len) {
-	        const char = str.charCodeAt(index);
-	        if (char === SEMI)
-	            break;
-	        index++;
-	    }
-	    return index;
-	}
-	/**
-	 * Skip optional whitespace (OWS) in an HTTP header value.
-	 *
-	 * OWS is defined in RFC 9110 sec 5.6.3 as SP (" ") or HTAB ("\t").
-	 */
-	function skipOWS(header, index, len) {
-	    while (index < len) {
-	        const char = header.charCodeAt(index);
-	        if (char !== SP && char !== HTAB)
-	            break;
-	        index++;
-	    }
-	    return index;
-	}
-	/**
-	 * Trim optional whitespace (OWS) from the end of a substring.
-	 *
-	 * OWS is defined in RFC 9110 sec 5.6.3 as SP (" ") or HTAB ("\t").
-	 */
-	function trailingOWS(header, start, end) {
-	    while (end > start) {
-	        const char = header.charCodeAt(end - 1);
-	        if (char !== SP && char !== HTAB)
-	            break;
-	        end--;
-	    }
-	    return end;
-	}
-	/**
-	 * Serialize a parameter value.
-	 */
-	function qstring(str) {
-	    if (TOKEN_REGEXP.test(str))
-	        return str;
-	    if (TEXT_REGEXP.test(str))
-	        return `"${str.replace(QUOTE_REGEXP, "\\$&")}"`;
-	    throw new TypeError(`Invalid parameter value: ${str}`);
-	}
-	
-	return dist;
+/*!
+ * content-type
+ * Copyright(c) 2015 Douglas Christopher Wilson
+ * MIT Licensed
+ */
+/**
+ * Null object perf optimization. Faster than `Object.create(null)` and `{ __proto__: null }`.
+ */
+const NullObject = /* @__PURE__ */ (() => {
+    const C = function () { };
+    C.prototype = Object.create(null);
+    return C;
+})();
+/**
+ * Parse a `Content-Type` header.
+ */
+function parse$1(header, options) {
+    const stopChar = 65_536; // Sentinel for "no stop char".
+    const len = header.length;
+    let index = skipOWS(header, 0, len);
+    const valueStart = index;
+    index = skipValue(header, index, len, stopChar);
+    const valueEnd = trailingOWS(header, valueStart, index);
+    const type = header.slice(valueStart, valueEnd).toLowerCase();
+    return parseParameters(header, type, index, len, stopChar);
 }
-
-var distExports = requireDist();
+const SP = 32; // " "
+const HTAB = 9; // "\t"
+const SEMI = 59; // ";"
+const EQ = 61; // "="
+const DQUOTE = 34; // '"'
+const BSLASH = 92; // "\\"
+/**
+ * Parses the parameters of a `Content-Type` header starting at the given index.
+ */
+function parseParameters(header, type, index, len, stopChar) {
+    const parameters = new NullObject();
+    parameter: while (index < len) {
+        if (header.charCodeAt(index) === stopChar)
+            break;
+        index = skipOWS(header, index + 1 /* Skip over ; */, len);
+        const keyStart = index;
+        while (index < len) {
+            const code = header.charCodeAt(index);
+            if (code === stopChar)
+                break parameter;
+            if (code === SEMI)
+                continue parameter;
+            if (code === EQ) {
+                const keyEnd = trailingOWS(header, keyStart, index);
+                const key = header.slice(keyStart, keyEnd).toLowerCase();
+                index = skipOWS(header, index + 1, len);
+                if (index < len && header.charCodeAt(index) === DQUOTE) {
+                    index++;
+                    let value = "";
+                    while (index < len) {
+                        const code = header.charCodeAt(index++);
+                        if (code === DQUOTE) {
+                            index = skipValue(header, index, len, stopChar);
+                            if (parameters[key] === undefined)
+                                parameters[key] = value;
+                            break;
+                        }
+                        if (code === BSLASH && index < len) {
+                            value += header[index++];
+                            continue;
+                        }
+                        value += String.fromCharCode(code);
+                    }
+                    continue parameter;
+                }
+                const valueStart = index;
+                index = skipValue(header, index, len, stopChar);
+                if (parameters[key] === undefined) {
+                    const valueEnd = trailingOWS(header, valueStart, index);
+                    parameters[key] = header.slice(valueStart, valueEnd);
+                }
+                continue parameter;
+            }
+            index++;
+        }
+    }
+    return { type, index, parameters };
+}
+/**
+ * Skip over characters until a semicolon or other exit character.
+ */
+function skipValue(str, index, len, stopChar) {
+    while (index < len) {
+        const code = str.charCodeAt(index);
+        if (code === SEMI || code === stopChar)
+            break;
+        index++;
+    }
+    return index;
+}
+/**
+ * Skip optional whitespace (OWS) in an HTTP header value.
+ *
+ * OWS is defined in RFC 9110 sec 5.6.3 as SP (" ") or HTAB ("\t").
+ */
+function skipOWS(header, index, len) {
+    while (index < len) {
+        const char = header.charCodeAt(index);
+        if (char !== SP && char !== HTAB)
+            break;
+        index++;
+    }
+    return index;
+}
+/**
+ * Trim optional whitespace (OWS) from the end of a substring.
+ *
+ * OWS is defined in RFC 9110 sec 5.6.3 as SP (" ") or HTAB ("\t").
+ */
+function trailingOWS(header, start, end) {
+    while (end > start) {
+        const char = header.charCodeAt(end - 1);
+        if (char !== SP && char !== HTAB)
+            break;
+        end--;
+    }
+    return end;
+}
 
 const intRegex = /^-?\d+$/;
 const noiseValue = /^-?\d+n+$/; // Noise - strings that match the custom format before being converted to it
@@ -34325,7 +34393,7 @@ const JSONParseV2 = (text, reviver) => {
 const MAX_INT = Number.MAX_SAFE_INTEGER.toString();
 const MAX_DIGITS = MAX_INT.length;
 const stringsOrLargeNumbers =
-  /"(?:\\.|[^"])*"|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/g;
+  /"(?:[^"\\]|\\.)*"|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/g;
 const noiseValueWithQuotes = /^"-?\d+n+"$/; // Noise - strings that match the custom format before being converted to it
 
 /**
@@ -34504,7 +34572,7 @@ class RequestError extends Error {
 // pkg/dist-src/index.js
 
 // pkg/dist-src/version.js
-var VERSION$7 = "10.0.11";
+var VERSION$7 = "10.0.15";
 
 // pkg/dist-src/defaults.js
 var defaults_default = {
@@ -34626,7 +34694,7 @@ async function getResponseData(response) {
   if (!contentType) {
     return response.text().catch(noop$2);
   }
-  const mimetype = distExports.parse(contentType);
+  const mimetype = parse$1(contentType);
   if (isJSONResponse(mimetype)) {
     let text = "";
     try {
@@ -34635,7 +34703,10 @@ async function getResponseData(response) {
     } catch (err) {
       return text;
     }
-  } else if (mimetype.type.startsWith("text/") || mimetype.parameters.charset?.toLowerCase() === "utf-8") {
+  } else if (mimetype.type.startsWith("text/") || // `application/octet-stream` is the canonical "arbitrary binary" type
+  // (RFC 2046) and must never be decoded as text, even when the response
+  // carries a (misleading) `charset=utf-8` parameter — see #751.
+  mimetype.parameters.charset?.toLowerCase() === "utf-8" && mimetype.type !== "application/octet-stream") {
     return response.text().catch(noop$2);
   } else {
     return response.arrayBuffer().catch(
@@ -34714,6 +34785,9 @@ var GraphqlResponseError = class extends Error {
       Error.captureStackTrace(this, this.constructor);
     }
   }
+  request;
+  headers;
+  response;
   name = "GraphqlResponseError";
   errors;
   data;
@@ -34808,6 +34882,7 @@ function withCustomRequest(customRequest) {
     url: "/graphql"
   });
 }
+/* v8 ignore if -- @preserve */
 
 // pkg/dist-src/is-jwt.js
 var b64url = "(?:[a-zA-Z0-9_-]+)";
@@ -34862,7 +34937,7 @@ var createTokenAuth = function createTokenAuth2(token) {
   });
 };
 
-const VERSION$5 = "7.0.6";
+const VERSION$5 = "7.0.7";
 
 const noop$1 = () => {
 };
@@ -39468,18 +39543,13 @@ function throttling(octokit, octokitOptions) {
   if (typeof connection !== "undefined") {
     common.connection = connection;
   }
-  if (groups.global == null) {
-    createGroups(Bottleneck, common);
-  }
   const state = Object.assign(
     {
       clustering: connection != null,
       triggersNotification,
       fallbackSecondaryRateRetryAfter: 60,
       retryAfterBaseValue: 1e3,
-      retryLimiter: new Bottleneck(),
-      id,
-      ...groups
+      id
     },
     octokitOptions.throttle
   );
@@ -39496,65 +39566,84 @@ function throttling(octokit, octokitOptions) {
         })
     `);
   }
-  const events = {};
-  const emitter = new Bottleneck.Events(events);
-  events.on("secondary-limit", state.onSecondaryRateLimit);
-  events.on("rate-limit", state.onRateLimit);
-  events.on(
-    "error",
-    (e) => octokit.log.warn("Error in throttling-plugin limit handler", e)
-  );
-  state.retryLimiter.on("failed", async function(error, info) {
-    const [state2, request, options] = info.args;
-    const { pathname } = new URL(options.url, "http://github.test");
-    const shouldRetryGraphQL = pathname.startsWith("/graphql") && error.status !== 401;
-    if (!(shouldRetryGraphQL || error.status === 403 || error.status === 429)) {
+  let initialized = false;
+  const initializeBottleneck = () => {
+    if (initialized) {
       return;
     }
-    const retryCount = ~~request.retryCount;
-    request.retryCount = retryCount;
-    options.request.retryCount = retryCount;
-    const { wantRetry, retryAfter = 0 } = await (async function() {
-      if (/\bsecondary rate\b/i.test(error.message)) {
-        const retryAfter2 = Number(error.response.headers["retry-after"]) || state2.fallbackSecondaryRateRetryAfter;
-        const wantRetry2 = await emitter.trigger(
-          "secondary-limit",
-          retryAfter2,
-          options,
-          octokit,
-          retryCount
-        );
-        return { wantRetry: wantRetry2, retryAfter: retryAfter2 };
-      }
-      if (error.response.headers != null && error.response.headers["x-ratelimit-remaining"] === "0" || (error.response.data?.errors ?? []).some(
-        (error2) => error2.type === "RATE_LIMITED"
-      )) {
-        const rateLimitReset = new Date(
-          ~~error.response.headers["x-ratelimit-reset"] * 1e3
-        ).getTime();
-        const retryAfter2 = Math.max(
-          // Add one second so we retry _after_ the reset time
-          // https://docs.github.com/en/rest/overview/resources-in-the-rest-api?apiVersion=2022-11-28#exceeding-the-rate-limit
-          Math.ceil((rateLimitReset - Date.now()) / 1e3) + 1,
-          0
-        );
-        const wantRetry2 = await emitter.trigger(
-          "rate-limit",
-          retryAfter2,
-          options,
-          octokit,
-          retryCount
-        );
-        return { wantRetry: wantRetry2, retryAfter: retryAfter2 };
-      }
-      return {};
-    })();
-    if (wantRetry) {
-      request.retryCount++;
-      return retryAfter * state2.retryAfterBaseValue;
+    initialized = true;
+    if (groups.global == null) {
+      createGroups(Bottleneck, common);
     }
+    state.global = state.global ?? groups.global;
+    state.auth = state.auth ?? groups.auth;
+    state.search = state.search ?? groups.search;
+    state.write = state.write ?? groups.write;
+    state.notifications = state.notifications ?? groups.notifications;
+    state.retryLimiter = state.retryLimiter ?? new Bottleneck();
+    const events = {};
+    const emitter = new Bottleneck.Events(events);
+    events.on("secondary-limit", state.onSecondaryRateLimit);
+    events.on("rate-limit", state.onRateLimit);
+    events.on(
+      "error",
+      (e) => octokit.log.warn("Error in throttling-plugin limit handler", e)
+    );
+    state.retryLimiter.on("failed", async function(error, info) {
+      const [state2, request, options] = info.args;
+      const { pathname } = new URL(options.url, "http://github.test");
+      const shouldRetryGraphQL = pathname.startsWith("/graphql") && error.status !== 401;
+      if (!(shouldRetryGraphQL || error.status === 403 || error.status === 429)) {
+        return;
+      }
+      const retryCount = ~~request.retryCount;
+      request.retryCount = retryCount;
+      options.request.retryCount = retryCount;
+      const { wantRetry, retryAfter = 0 } = await (async function() {
+        if (/\bsecondary rate\b/i.test(error.message)) {
+          const retryAfter2 = Number(error.response.headers["retry-after"]) || state2.fallbackSecondaryRateRetryAfter;
+          const wantRetry2 = await emitter.trigger(
+            "secondary-limit",
+            retryAfter2,
+            options,
+            octokit,
+            retryCount
+          );
+          return { wantRetry: wantRetry2, retryAfter: retryAfter2 };
+        }
+        if (error.response.headers != null && error.response.headers["x-ratelimit-remaining"] === "0" || (error.response.data?.errors ?? []).some(
+          (error2) => error2.type === "RATE_LIMITED"
+        )) {
+          const rateLimitReset = new Date(
+            ~~error.response.headers["x-ratelimit-reset"] * 1e3
+          ).getTime();
+          const retryAfter2 = Math.max(
+            // Add one second so we retry _after_ the reset time
+            // https://docs.github.com/en/rest/overview/resources-in-the-rest-api?apiVersion=2022-11-28#exceeding-the-rate-limit
+            Math.ceil((rateLimitReset - Date.now()) / 1e3) + 1,
+            0
+          );
+          const wantRetry2 = await emitter.trigger(
+            "rate-limit",
+            retryAfter2,
+            options,
+            octokit,
+            retryCount
+          );
+          return { wantRetry: wantRetry2, retryAfter: retryAfter2 };
+        }
+        return {};
+      })();
+      if (wantRetry) {
+        request.retryCount++;
+        return retryAfter * state2.retryAfterBaseValue;
+      }
+    });
+  };
+  octokit.hook.wrap("request", (request, options) => {
+    initializeBottleneck();
+    return wrapRequest(state, request, options);
   });
-  octokit.hook.wrap("request", wrapRequest.bind(null, state));
   return {};
 }
 throttling.VERSION = VERSION$1;
@@ -44382,7 +44471,7 @@ const upload = async (args) => {
 
 var src = {exports: {}};
 
-var browser$1 = {exports: {}};
+var browser = {exports: {}};
 
 /**
  * Helpers.
@@ -44857,11 +44946,11 @@ function requireCommon () {
 
 /* eslint-env browser */
 
-var hasRequiredBrowser$1;
+var hasRequiredBrowser;
 
-function requireBrowser$1 () {
-	if (hasRequiredBrowser$1) return browser$1.exports;
-	hasRequiredBrowser$1 = 1;
+function requireBrowser () {
+	if (hasRequiredBrowser) return browser.exports;
+	hasRequiredBrowser = 1;
 	(function (module, exports) {
 		/**
 		 * This is the web browser implementation of `debug()`.
@@ -45133,44 +45222,11 @@ function requireBrowser$1 () {
 				return '[UnexpectedJSONParseError]: ' + error.message;
 			}
 		}; 
-	} (browser$1, browser$1.exports));
-	return browser$1.exports;
+	} (browser, browser.exports));
+	return browser.exports;
 }
 
 var node = {exports: {}};
-
-/* eslint-env browser */
-
-var browser;
-var hasRequiredBrowser;
-
-function requireBrowser () {
-	if (hasRequiredBrowser) return browser;
-	hasRequiredBrowser = 1;
-
-	function getChromeVersion() {
-		const matches = /(Chrome|Chromium)\/(?<chromeVersion>\d+)\./.exec(navigator.userAgent);
-
-		if (!matches) {
-			return;
-		}
-
-		return Number.parseInt(matches.groups.chromeVersion, 10);
-	}
-
-	const colorSupport = getChromeVersion() >= 69 ? {
-		level: 1,
-		hasBasic: true,
-		has256: false,
-		has16m: false
-	} : false;
-
-	browser = {
-		stdout: colorSupport,
-		stderr: colorSupport
-	};
-	return browser;
-}
 
 /**
  * Module dependencies.
@@ -45209,7 +45265,7 @@ function requireNode () {
 		try {
 			// Optional dependency (as in, doesn't need to be installed, NOT like optionalDependencies in package.json)
 			// eslint-disable-next-line import/no-extraneous-dependencies
-			const supportsColor = requireBrowser();
+			const supportsColor = require('supports-color');
 
 			if (supportsColor && (supportsColor.stderr || supportsColor).level >= 2) {
 				exports.colors = [
@@ -45456,7 +45512,7 @@ function requireSrc () {
 	if (hasRequiredSrc) return src.exports;
 	hasRequiredSrc = 1;
 	if (typeof process === 'undefined' || process.type === 'renderer' || process.browser === true || process.__nwjs) {
-		src.exports = requireBrowser$1();
+		src.exports = requireBrowser();
 	} else {
 		src.exports = requireNode();
 	}
